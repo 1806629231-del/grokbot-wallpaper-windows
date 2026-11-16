@@ -14,7 +14,7 @@
 
 ### 1. 怎么安装？
 不需要自己打开黑框敲代码，直接把这句话发给你的 Grok Bot（Agent）：
-> 「帮我安装这个 Windows 版 Grok Bot 换壁纸项目：`<本仓库 GitHub 地址>`」
+> 「帮我安装这个 Windows 版 Grok Bot 换壁纸项目：`https://github.com/1806629231-del/grokbot-wallpaper-windows`」
 
 Bot 会自动把技能拉到本机准备好，全程不会修改官方的 `Grok Bot.exe` 或内部打包文件。
 
