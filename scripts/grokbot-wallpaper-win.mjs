@@ -15,9 +15,12 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { execFile, spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+const THIS_FILE = fileURLToPath(import.meta.url);
+const BUNDLED_EXAMPLE_IMAGE = path.resolve(path.dirname(THIS_FILE), '..', 'examples', 'deepseek-whale-girl.png');
 const CDP_PORT = 19222;
 const HELPER_PORT = 19223;
 const CDP_BASE = `http://127.0.0.1:${CDP_PORT}`;
@@ -31,6 +34,10 @@ const STATE_DIR = IS_WIN
   : path.join(homedir(), 'Library', 'Application Support', 'grokbot-wallpaper-win');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const SCRIPTS_FILE = path.join(STATE_DIR, 'injected-scripts.json');
+const LOCAL_SCRIPT_COPY = path.join(STATE_DIR, 'grokbot-wallpaper-win.mjs');
+const OPEN_PS1_FILE = path.join(STATE_DIR, 'open-grokbot.ps1');
+const SHORTCUT_BACKUP_DIR = path.join(STATE_DIR, 'shortcut-backups');
+const SHORTCUT_MANIFEST = path.join(SHORTCUT_BACKUP_DIR, 'manifest.json');
 
 // Built-in default soft ocean-blue gradient SVG data URL when user runs `init` before choosing an image
 const DEFAULT_PLACEHOLDER_SVG =
@@ -54,17 +61,20 @@ const DEFAULT_PLACEHOLDER_SVG =
 const USAGE = `Grok Bot 换壁纸（Windows 适配版 · 支持 Windows 10/11 & macOS，需 Node.js 22+）
 
 用法：
-  node scripts/grokbot-wallpaper-win.mjs init [--relaunch]
-  node scripts/grokbot-wallpaper-win.mjs apply [图片路径] [--opacity 0.88] [--dark|--light] [--relaunch]
+  node scripts/grokbot-wallpaper-win.mjs install [图片路径] [--opacity 0.88] [--dark|--light] [--relaunch]
+  node scripts/grokbot-wallpaper-win.mjs init [--persist] [--relaunch]
+  node scripts/grokbot-wallpaper-win.mjs apply [图片路径] [--opacity 0.88] [--dark|--light] [--persist] [--relaunch]
   node scripts/grokbot-wallpaper-win.mjs status
   node scripts/grokbot-wallpaper-win.mjs restore
+  node scripts/grokbot-wallpaper-win.mjs uninstall
   node scripts/grokbot-wallpaper-win.mjs watch
   node scripts/grokbot-wallpaper-win.mjs snapshot <输出.png>
 
 说明：
-  - init / apply 会在当前官方 Grok Bot 窗口右下角挂出「壁纸」悬浮面板，可直接点击「上传壁纸」挑一张喜欢的图并拖动滑条调透明度。
-  - 首次启用本机调试端口需先保存工作并加 --relaunch 重启一次 Grok Bot。
-  - 仅绑定本机 127.0.0.1:${CDP_PORT} 与 127.0.0.1:${HELPER_PORT}，不改 app.asar 或安装包，彻底退出客户端后自动还原。`;
+  - install 会默认换上内置的「蓝色大肥鱼」壁纸（也可传入自定义图片），挂出右下角「壁纸」小浮窗，并配置桌面/开始菜单图标自动挂载——以后每次点图标打开 Grok Bot 都自带壁纸与小浮窗。
+  - init / apply 会在当前官方 Grok Bot 窗口右下角挂出「壁纸」小浮窗（加 --persist 可同步开启每次打开自动挂载）。
+  - uninstall 一键移除当前壁纸、停止后台同步助手，并把桌面/开始菜单快捷方式完全恢复原状。
+  - 首次开启本机调试端口需先保存工作并加 --relaunch 重启一次 Grok Bot；全程仅绑定 127.0.0.1:${CDP_PORT} / ${HELPER_PORT}，绝不修改 Grok Bot.exe、app.asar 或注册表。`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -72,6 +82,15 @@ function clampOpacity(val) {
   const n = Number(val);
   if (!Number.isFinite(n)) throw new Error('透明度必须是 0.15 到 1 之间的数字。');
   return Math.max(0.15, Math.min(1, n));
+}
+
+async function fileExists(p) {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function readJsonSafe(file, fallback = null) {
@@ -84,7 +103,7 @@ async function readJsonSafe(file, fallback = null) {
 }
 
 async function writeJsonAtomic(file, obj) {
-  await fs.mkdir(STATE_DIR, { recursive: true });
+  await fs.mkdir(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
   await fs.writeFile(tmp, JSON.stringify(obj, null, 2), 'utf8');
   await fs.rename(tmp, file);
@@ -97,19 +116,13 @@ async function findOfficialAppPath() {
       path.join(process.env.LOCALAPPDATA || path.join(homedir(), 'AppData', 'Local'), 'Programs', 'Grok Bot', 'Grok Bot.exe'),
     ];
     for (const p of candidates) {
-      try {
-        await fs.access(p);
-        return p;
-      } catch {}
+      if (await fileExists(p)) return p;
     }
     return null;
   }
   if (IS_MAC) {
     for (const p of ['/Applications/Grok Bot.app', path.join(homedir(), 'Applications', 'Grok Bot.app')]) {
-      try {
-        await fs.access(p);
-        return p;
-      } catch {}
+      if (await fileExists(p)) return p;
     }
   }
   return null;
@@ -161,16 +174,24 @@ async function isAppRunning(appExe) {
 
 async function closeOfficialAppGracefully(appExe) {
   if (IS_WIN) {
-    // Request graceful window close via taskkill WITHOUT /F first
     try {
-      await execFileAsync('taskkill.exe', ['/IM', 'Grok Bot.exe'], { windowsHide: true, timeout: 8000 });
+      await execFileAsync('taskkill.exe', ['/IM', 'Grok Bot.exe'], { windowsHide: true, timeout: 6000 });
     } catch {}
-    const deadline = Date.now() + 8000;
-    while (Date.now() < deadline) {
+    const softDeadline = Date.now() + 3500;
+    while (Date.now() < softDeadline) {
       if (!(await isAppRunning(appExe))) return;
-      await sleep(300);
+      await sleep(250);
     }
-    throw new Error('Grok Bot 仍在运行（可能最小化在系统托盘）。为保护未保存内容，脚本不会强制杀进程；请先在右下角托盘右键退出 Grok Bot，再重试。');
+    // Tray-minimized Electron instances have MainWindowHandle=0 and ignore non-forced WM_CLOSE
+    try {
+      await execFileAsync('taskkill.exe', ['/IM', 'Grok Bot.exe', '/T', '/F'], { windowsHide: true, timeout: 6000 });
+    } catch {}
+    const hardDeadline = Date.now() + 5000;
+    while (Date.now() < hardDeadline) {
+      if (!(await isAppRunning(appExe))) return;
+      await sleep(250);
+    }
+    throw new Error('未能退出后台运行中的 Grok Bot，请先在右下角系统托盘右键退出后再试。');
   }
   if (IS_MAC) {
     try {
@@ -185,18 +206,37 @@ async function closeOfficialAppGracefully(appExe) {
   }
 }
 
+async function launchDetachedWin(filePath, args = [], hidden = false) {
+  // Launch via PowerShell Start-Process outside temporary CLI job groups when possible
+  const psFile = filePath.replace(/'/g, "''");
+  const psArgs = args.map((a) => `'${String(a).replace(/'/g, "''")}'`).join(', ');
+  const argClause = args.length > 0 ? `-ArgumentList @(${psArgs})` : '';
+  const styleClause = hidden ? '-WindowStyle Hidden' : '';
+  const cmd = `Start-Process -FilePath '${psFile}' ${argClause} ${styleClause}`;
+  try {
+    await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', cmd], {
+      windowsHide: true,
+      timeout: 8000,
+    });
+  } catch {
+    const child = spawn(filePath, args, { detached: true, stdio: 'ignore', windowsHide: hidden });
+    child.unref();
+  }
+}
+
 async function relaunchWithDebugPort(appExe) {
   if (!appExe) throw new Error('未检测到官方 Grok Bot 安装路径，请确认已安装官方桌面客户端。');
   if (await isAppRunning(appExe)) {
     await closeOfficialAppGracefully(appExe);
   }
   if (IS_WIN) {
-    const child = spawn(appExe, [`--remote-debugging-port=${CDP_PORT}`, '--remote-debugging-address=127.0.0.1'], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: false,
-    });
-    child.unref();
+    const manifest = await readJsonSafe(SHORTCUT_MANIFEST, null);
+    const preferredLnk = manifest?.activeShortcut && (await fileExists(manifest.activeShortcut)) ? manifest.activeShortcut : null;
+    if (preferredLnk) {
+      await execFileAsync('explorer.exe', [preferredLnk], { windowsHide: true }).catch(() => {});
+    } else {
+      await launchDetachedWin(appExe, [`--remote-debugging-port=${CDP_PORT}`, '--remote-debugging-address=127.0.0.1'], false);
+    }
   } else {
     await execFileAsync('open', ['-a', appExe, '--args', `--remote-debugging-port=${CDP_PORT}`, '--remote-debugging-address=127.0.0.1']);
   }
@@ -209,20 +249,35 @@ async function relaunchWithDebugPort(appExe) {
   throw new Error('等待 Grok Bot 本机调试端口就绪超时（35 秒）。');
 }
 
+function filterRendererTargets(all) {
+  return (all || []).filter((t) => {
+    if (!['page', 'webview'].includes(t.type) || !t.webSocketDebuggerUrl) return false;
+    if (/^(devtools|chrome|chrome-extension):/i.test(t.url || '')) return false;
+    if (IS_WIN) {
+      const u = (t.url || '').replace(/\\/g, '/').toLowerCase();
+      return t.title === 'Grok Bot' || u.includes('/grok%20bot/resources/app.asar/') || u.includes('/grok bot/resources/app.asar/');
+    }
+    return true;
+  });
+}
+
+async function tryListRendererTargets() {
+  try {
+    const all = await fetchJson(CDP_BASE, '/json/list', 1800);
+    return filterRendererTargets(all);
+  } catch {
+    return [];
+  }
+}
+
 async function listRendererTargets() {
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
-    const all = await fetchJson(CDP_BASE, '/json/list', 2500);
-    const filtered = all.filter((t) => {
-      if (!['page', 'webview'].includes(t.type) || !t.webSocketDebuggerUrl) return false;
-      if (/^(devtools|chrome|chrome-extension):/i.test(t.url || '')) return false;
-      if (IS_WIN) {
-        const u = (t.url || '').replace(/\\/g, '/').toLowerCase();
-        return t.title === 'Grok Bot' || u.includes('/grok%20bot/resources/app.asar/') || u.includes('/grok bot/resources/app.asar/');
-      }
-      return true;
-    });
-    if (filtered.length > 0) return filtered;
+    try {
+      const all = await fetchJson(CDP_BASE, '/json/list', 2500);
+      const filtered = filterRendererTargets(all);
+      if (filtered.length > 0) return filtered;
+    } catch {}
     await sleep(300);
   }
   throw new Error('未找到官方 Grok Bot 渲染窗口，请先打开主界面后重试。');
@@ -709,6 +764,12 @@ async function startLocalSyncServer() {
       res.end(JSON.stringify({ ok: true, pid: process.pid }));
       return;
     }
+    if (req.method === 'POST' && req.url === '/shutdown') {
+      res.writeHead(200, headers);
+      res.end(JSON.stringify({ ok: true }));
+      setTimeout(() => process.exit(0), 80);
+      return;
+    }
     if (req.method === 'POST' && req.url === '/sync') {
       try {
         const chunks = [];
@@ -761,16 +822,28 @@ async function startLocalSyncServer() {
   return true;
 }
 
+async function stopWatchDaemon() {
+  try {
+    await fetch(`${HELPER_BASE}/shutdown`, { method: 'POST', signal: AbortSignal.timeout(1200) });
+    await sleep(250);
+  } catch {}
+}
+
 async function ensureBackgroundWatchDaemon() {
   if (await probeHelper()) return true;
   await fs.mkdir(STATE_DIR, { recursive: true });
-  const child = spawn(process.execPath, [path.resolve(process.argv[1]), 'watch'], {
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: true,
-  });
-  child.unref();
-  const deadline = Date.now() + 4000;
+  const watchScript = (await fileExists(LOCAL_SCRIPT_COPY)) ? LOCAL_SCRIPT_COPY : path.resolve(THIS_FILE);
+  if (IS_WIN) {
+    await launchDetachedWin(process.execPath, [watchScript, 'watch'], true);
+  } else {
+    const child = spawn(process.execPath, [watchScript, 'watch'], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+  }
+  const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     if (await probeHelper()) return true;
     await sleep(150);
@@ -779,30 +852,185 @@ async function ensureBackgroundWatchDaemon() {
 }
 
 async function runWatchLoop() {
-  await startLocalSyncServer();
-  let lastWs = null;
+  try {
+    await startLocalSyncServer();
+  } catch {
+    return;
+  }
+  const injectedTargetIds = new Set();
   for (;;) {
     try {
-      const ver = await probeCdp();
-      const ws = ver?.webSocketDebuggerUrl || null;
-      if (ws && ws !== lastWs) {
+      const targets = await tryListRendererTargets();
+      const currentIds = new Set(targets.map((t) => t.id));
+      for (const id of [...injectedTargetIds]) {
+        if (!currentIds.has(id)) injectedTargetIds.delete(id);
+      }
+
+      const hasNewTarget = targets.some((t) => !injectedTargetIds.has(t.id));
+      if (hasNewTarget) {
         const saved = await readJsonSafe(STATE_FILE, null);
-        if (saved && saved.imagePath && !saved.restored) {
-          const img = await prepareLocalImage(saved.imagePath);
+        if (saved && !saved.restored) {
+          await sleep(500);
+          let dataUrl = DEFAULT_PLACEHOLDER_SVG;
+          if (saved.imagePath && (await fileExists(saved.imagePath))) {
+            const img = await prepareLocalImage(saved.imagePath);
+            dataUrl = img.dataUrl;
+          }
           await injectOverlayToWindow({
-            dataUrl: img.dataUrl,
+            dataUrl,
             opacity: clampOpacity(saved.opacity ?? 0.88),
             appearance: saved.appearance === 'light' ? 'light' : 'dark',
             helperUrl: HELPER_BASE,
           });
+          const refreshed = await tryListRendererTargets();
+          for (const t of refreshed) injectedTargetIds.add(t.id);
         }
-        lastWs = ws;
-      } else if (!ws) {
-        lastWs = null;
       }
     } catch {}
-    await sleep(1000);
+    await sleep(1200);
   }
+}
+
+async function enableAutoOpenPersistence(appExe) {
+  await fs.mkdir(STATE_DIR, { recursive: true });
+  if (path.resolve(THIS_FILE) !== path.resolve(LOCAL_SCRIPT_COPY)) {
+    await fs.copyFile(THIS_FILE, LOCAL_SCRIPT_COPY);
+  }
+  if (!IS_WIN) {
+    return { enabled: false, note: 'macOS 当前保持手动/会话模式' };
+  }
+
+  const psLauncher = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$appExe = '${appExe.replace(/'/g, "''")}'`,
+    `$nodeExe = '${process.execPath.replace(/'/g, "''")}'`,
+    `$scriptPath = '${LOCAL_SCRIPT_COPY.replace(/'/g, "''")}'`,
+    "$c = New-Object System.Net.Sockets.TcpClient",
+    `$ready = $c.ConnectAsync('127.0.0.1', ${CDP_PORT}).Wait(150)`,
+    "$c.Dispose()",
+    "if (-not $ready) {",
+    "  $procs = @(Get-Process -Name 'Grok Bot' -ErrorAction SilentlyContinue)",
+    "  if ($procs.Count -gt 0 -and @($procs | Where-Object { $_.MainWindowHandle -ne 0 }).Count -eq 0) {",
+    "    Stop-Process -Name 'Grok Bot' -Force -ErrorAction SilentlyContinue",
+    "    Start-Sleep -Milliseconds 400",
+    "  }",
+    "}",
+    `Start-Process -FilePath $appExe -ArgumentList '--remote-debugging-port=${CDP_PORT}','--remote-debugging-address=127.0.0.1' -WorkingDirectory (Split-Path $appExe)`,
+    "Start-Process -FilePath $nodeExe -ArgumentList ('\"' + $scriptPath + '\"'), 'watch' -WindowStyle Hidden",
+  ].join('\r\n');
+  await fs.writeFile(OPEN_PS1_FILE, psLauncher, 'utf8');
+
+  await fs.mkdir(SHORTCUT_BACKUP_DIR, { recursive: true });
+  const prevManifest = (await readJsonSafe(SHORTCUT_MANIFEST, null)) || { entries: [] };
+
+  const psUpdate = `
+$ErrorActionPreference = 'Stop'
+$appExe = '${appExe.replace(/'/g, "''")}'
+$ps1 = '${OPEN_PS1_FILE.replace(/'/g, "''")}'
+$backupDir = '${SHORTCUT_BACKUP_DIR.replace(/'/g, "''")}'
+$wsh = New-Object -ComObject WScript.Shell
+
+$candidates = @(
+  @{ Key = 'userDesktop'; Path = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Grok Bot.lnk') },
+  @{ Key = 'publicDesktop'; Path = (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Grok Bot.lnk') },
+  @{ Key = 'userStartMenu'; Path = (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\\Grok Bot.lnk') },
+  @{ Key = 'commonStartMenu'; Path = (Join-Path ([Environment]::GetFolderPath('CommonStartMenu')) 'Programs\\Grok Bot.lnk') }
+)
+
+$updated = @()
+$desktopUpdated = $false
+foreach ($item in $candidates) {
+  if (Test-Path $item.Path) {
+    $bak = Join-Path $backupDir ($item.Key + '.lnk.bak')
+    if (-not (Test-Path $bak)) {
+      Copy-Item -Path $item.Path -Destination $bak -Force
+    }
+    try {
+      $sc = $wsh.CreateShortcut($item.Path)
+      $sc.TargetPath = "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+      $sc.Arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ps1 + '"'
+      $sc.WorkingDirectory = (Split-Path $appExe)
+      $sc.IconLocation = $appExe + ',0'
+      $sc.WindowStyle = 7
+      $sc.Save()
+      $updated += @{ key = $item.Key; path = $item.Path; backup = $bak; created = $false }
+      if ($item.Key -like '*Desktop') { $desktopUpdated = $true }
+    } catch {}
+  }
+}
+
+if (-not $desktopUpdated) {
+  $userDeskLnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Grok Bot.lnk'
+  $sc = $wsh.CreateShortcut($userDeskLnk)
+  $sc.TargetPath = "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+  $sc.Arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ps1 + '"'
+  $sc.WorkingDirectory = (Split-Path $appExe)
+  $sc.IconLocation = $appExe + ',0'
+  $sc.WindowStyle = 7
+  $sc.Save()
+  $updated += @{ key = 'userDesktopCreated'; path = $userDeskLnk; backup = ''; created = $true }
+}
+
+$updated | ConvertTo-Json -Compress
+`;
+
+  const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psUpdate], {
+    windowsHide: true,
+    timeout: 12000,
+  });
+  const parsed = JSON.parse(stdout.trim() || '[]');
+  const entries = Array.isArray(parsed) ? parsed : [parsed];
+  const merged = prevManifest.entries?.length ? prevManifest.entries : entries;
+  const activeShortcut = entries.find((e) => e.path)?.path || null;
+  await writeJsonAtomic(SHORTCUT_MANIFEST, {
+    enabled: true,
+    appExe,
+    activeShortcut,
+    entries: merged,
+    updatedAt: new Date().toISOString(),
+  });
+  return { enabled: true, shortcutsUpdated: entries.map((e) => e.path) };
+}
+
+async function disableAutoOpenPersistence(appExe) {
+  if (!IS_WIN) return { disabled: true };
+  const manifest = await readJsonSafe(SHORTCUT_MANIFEST, null);
+  if (manifest && Array.isArray(manifest.entries)) {
+    const psRestore = `
+$ErrorActionPreference = 'SilentlyContinue'
+$appExe = '${(appExe || manifest.appExe || 'C:\\Program Files\\Grok Bot\\Grok Bot.exe').replace(/'/g, "''")}'
+$entries = '${JSON.stringify(manifest.entries).replace(/'/g, "''")}' | ConvertFrom-Json
+$wsh = New-Object -ComObject WScript.Shell
+foreach ($e in $entries) {
+  if ($e.created -and (Test-Path $e.path)) {
+    Remove-Item -Path $e.path -Force
+  } elseif ($e.backup -and (Test-Path $e.backup)) {
+    Copy-Item -Path $e.backup -Destination $e.path -Force
+  } elseif (Test-Path $e.path) {
+    $sc = $wsh.CreateShortcut($e.path)
+    $sc.TargetPath = $appExe
+    $sc.Arguments = ''
+    $sc.WorkingDirectory = (Split-Path $appExe)
+    $sc.IconLocation = $appExe + ',0'
+    $sc.WindowStyle = 1
+    $sc.Save()
+  }
+}
+`;
+    await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psRestore], {
+      windowsHide: true,
+      timeout: 12000,
+    }).catch(() => {});
+  }
+  await fs.rm(OPEN_PS1_FILE, { force: true }).catch(() => {});
+  await writeJsonAtomic(SHORTCUT_MANIFEST, { enabled: false, entries: [], updatedAt: new Date().toISOString() });
+  return { disabled: true };
+}
+
+async function isAutoOpenEnabled() {
+  if (!IS_WIN) return false;
+  const m = await readJsonSafe(SHORTCUT_MANIFEST, null);
+  return Boolean(m && m.enabled && (await fileExists(OPEN_PS1_FILE)));
 }
 
 async function main() {
@@ -824,8 +1052,25 @@ async function main() {
     const cdp = await probeCdp();
     const helper = await probeHelper();
     const running = await isAppRunning(appExe);
+    const autoOpen = await isAutoOpenEnabled();
     const last = await readJsonSafe(STATE_FILE, null);
-    console.log(JSON.stringify({ platform: process.platform, appPath: appExe, running, debugPortReady: Boolean(cdp), panelHelperRunning: helper, port: CDP_PORT, helperPort: HELPER_PORT, state: last }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          platform: process.platform,
+          appPath: appExe,
+          running,
+          debugPortReady: Boolean(cdp),
+          panelHelperRunning: helper,
+          autoOpenEnabled: autoOpen,
+          port: CDP_PORT,
+          helperPort: HELPER_PORT,
+          state: last,
+        },
+        null,
+        2
+      )
+    );
     return;
   }
 
@@ -835,11 +1080,27 @@ async function main() {
   }
 
   if (cmd === 'restore') {
-    if (!(await probeCdp())) {
-      throw new Error('当前未开启本机调试端口；若要彻底清除临时壁纸，直接退出并重开 Grok Bot 即可恢复默认界面。');
+    if (await probeCdp()) {
+      await restoreWindow();
+    } else {
+      const prev = (await readJsonSafe(STATE_FILE, {})) || {};
+      await writeJsonAtomic(STATE_FILE, { ...prev, restored: true, restoredAt: new Date().toISOString() });
     }
-    await restoreWindow();
     console.log('已恢复 Grok Bot 默认界面并移除壁纸悬浮面板。');
+    return;
+  }
+
+  if (cmd === 'uninstall') {
+    const appExe = await findOfficialAppPath();
+    if (await probeCdp()) {
+      await restoreWindow().catch(() => {});
+    } else {
+      const prev = (await readJsonSafe(STATE_FILE, {})) || {};
+      await writeJsonAtomic(STATE_FILE, { ...prev, restored: true, restoredAt: new Date().toISOString() });
+    }
+    await stopWatchDaemon();
+    await disableAutoOpenPersistence(appExe);
+    console.log('已卸载自动挂载配置、恢复桌面/开始菜单原版快捷方式，并还原 Grok Bot 默认黑白界面。');
     return;
   }
 
@@ -852,15 +1113,18 @@ async function main() {
     return;
   }
 
-  if (cmd === 'init' || cmd === 'apply') {
+  if (cmd === 'install' || cmd === 'init' || cmd === 'apply') {
     let imageArg = null;
     let opacity = 0.88;
     let appearance = 'dark';
     let allowRelaunch = false;
+    let persistShortcut = cmd === 'install';
 
     for (let i = 0; i < rest.length; i++) {
       const a = rest[i];
       if (a === '--relaunch') allowRelaunch = true;
+      else if (a === '--persist' || a === '--autostart') persistShortcut = true;
+      else if (a === '--no-persist') persistShortcut = false;
       else if (a === '--dark') appearance = 'dark';
       else if (a === '--light') appearance = 'light';
       else if (a === '--opacity') opacity = clampOpacity(rest[++i]);
@@ -869,16 +1133,8 @@ async function main() {
       else throw new Error(`未知参数：${a}`);
     }
 
-    let cdp = await probeCdp();
-    if (!cdp) {
-      if (!allowRelaunch) {
-        console.error('首次启用壁纸面板需要重启一次 Grok Bot（仅在 127.0.0.1 开启本机调试口）。请先保存当前聊天工作，确认后加 --relaunch 参数重新执行。');
-        process.exitCode = 2;
-        return;
-      }
-      const appExe = await findOfficialAppPath();
-      cdp = await relaunchWithDebugPort(appExe);
-    }
+    const appExe = await findOfficialAppPath();
+    if (!appExe) throw new Error('未检测到官方 Grok Bot 安装路径，请确认已安装官方桌面客户端。');
 
     let dataUrl = DEFAULT_PLACEHOLDER_SVG;
     let imagePath = null;
@@ -891,17 +1147,19 @@ async function main() {
       sourcePath = prep.sourcePath;
     } else {
       const prev = await readJsonSafe(STATE_FILE, null);
-      if (prev && prev.imagePath && !prev.restored) {
-        try {
-          const prep = await prepareLocalImage(prev.imagePath);
-          dataUrl = prep.dataUrl;
-          imagePath = prep.imagePath;
-        } catch {}
+      if (prev && prev.imagePath && !prev.restored && (await fileExists(prev.imagePath))) {
+        const prep = await prepareLocalImage(prev.imagePath);
+        dataUrl = prep.dataUrl;
+        imagePath = prep.imagePath;
+        sourcePath = prev.sourcePath || prep.sourcePath;
+      } else if (cmd !== 'init' && (await fileExists(BUNDLED_EXAMPLE_IMAGE))) {
+        const prep = await prepareLocalImage(BUNDLED_EXAMPLE_IMAGE);
+        dataUrl = prep.dataUrl;
+        imagePath = prep.imagePath;
+        sourcePath = prep.sourcePath;
       }
     }
 
-    const helperOk = await ensureBackgroundWatchDaemon();
-    await injectOverlayToWindow({ dataUrl, opacity, appearance, helperUrl: HELPER_BASE });
     await writeJsonAtomic(STATE_FILE, {
       imagePath,
       sourcePath,
@@ -911,10 +1169,30 @@ async function main() {
       restored: false,
     });
 
+    let persistResult = null;
+    if (persistShortcut) {
+      persistResult = await enableAutoOpenPersistence(appExe);
+    }
+
+    let cdp = await probeCdp();
+    if (!cdp) {
+      if (!allowRelaunch) {
+        console.error('首次启用壁纸面板需要重启一次 Grok Bot（仅在 127.0.0.1 开启本机调试口）。请先保存当前聊天工作，确认后加 --relaunch 参数重新执行。');
+        process.exitCode = 2;
+        return;
+      }
+      cdp = await relaunchWithDebugPort(appExe);
+    }
+
+    const helperOk = await ensureBackgroundWatchDaemon();
+    await injectOverlayToWindow({ dataUrl, opacity, appearance, helperUrl: HELPER_BASE });
+
     console.log(
-      `已在 Grok Bot 窗口挂载壁纸面板（透明度 ${opacity}，后台同步助手：${helperOk ? '运行中' : '未启动'}）。\n` +
-      `现在可以直接点击窗口右下角「壁纸 → 上传壁纸」，挑一张你喜欢的图（4MB 以内 PNG/JPG/WEBP）并拖动滑条调透明度！\n` +
-      `提示：本工具仅作本机临时覆盖，不修改客户端安装包，彻底退出 Grok Bot 后需重新唤起。`
+      `已在 Grok Bot 窗口挂载壁纸与右下角「壁纸」小浮窗（透明度 ${opacity}，后台同步助手：${helperOk ? '运行中' : '未启动'}）。\n` +
+      (persistResult?.enabled
+        ? `已开启「打开即生效」：以后双击桌面或开始菜单的 Grok Bot 图标打开，都会自动带上壁纸和小浮窗！\n`
+        : '') +
+      `随时可点击右下角「壁纸 → 上传壁纸」换自己喜欢的图（4MB 以内 PNG/JPG/WEBP），或运行 uninstall 一键恢复原状。`
     );
     return;
   }
