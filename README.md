@@ -57,5 +57,5 @@ node scripts/grokbot-wallpaper-win.mjs restore
 
 ## 致谢与声明
 
-- 灵感致谢：受 [@KinGao476942](https://x.com/KinGao476942/status/2121763505665876302) 分享的 macOS 版 [`KinGao294/grokbot-wallpaper`](https://github.com/KinGao294/grokbot-wallpaper) 启发，本仓库为面向 Windows 官方客户端独立编写的 MIT 开源实现。
+- 灵感致谢：受 [Kin](https://x.com/KinGao476942/status/2121763505665876302) 开源的 macOS 版 [`KinGao294/grokbot-wallpaper`](https://github.com/KinGao294/grokbot-wallpaper) 启发，本仓库为面向 Windows 官方客户端独立编写的 MIT 开源实现。
 - 形象声明：`examples/deepseek-whale-girl.png` 为按社区“DeepSeek娘 / 鲸鱼娘 / 蓝色大肥鱼”同人二创设定生成的原创插画，非 DeepSeek 官方形象；本工具亦非 Grok Bot 官方出品。
